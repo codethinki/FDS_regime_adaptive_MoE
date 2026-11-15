@@ -1,0 +1,3 @@
+[submodule "external/portfolio-allocator"]
+	path = external/portfolio-allocator
+	url = https://github.com/emregulben/portfolio-allocator

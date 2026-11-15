@@ -1,0 +1,15 @@
+[project]
+name = "regime-adaptive-moe"
+version = "0.1.0"
+description = "Regime-adaptive mixture of experts for portfolio allocation with RL"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "yfinance",
+    "jumpmodels",
+    "ipykernel",
+    "nbformat",
+    "nbconvert",
+]
