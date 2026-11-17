@@ -1,0 +1,421 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+def map_to_feasible_portfolio(action_t: torch.Tensor, max_weight: float = 0.20) -> torch.Tensor:
+    """Enforces Markowitz constraints by safely parking illegal excess into Cash."""
+    w = torch.clamp(action_t, min=0.0)
+    w_sum = w.sum(dim=-1, keepdim=True)
+
+    # If all raw signals are non-positive, allocate 100% to Cash
+    zero_mask = w_sum < 1e-7
+    w = torch.where(zero_mask, torch.zeros_like(w), w / (w_sum + 1e-9))
+    w_risky = w[:, :-1]
+    w_cash = torch.where(zero_mask, torch.ones_like(w[:, -1:]), w[:, -1:])
+
+    excess = torch.clamp(w_risky - max_weight, min=0.0)
+    w_risky_clipped = w_risky - excess
+    w_cash_new = w_cash + excess.sum(dim=-1, keepdim=True)
+    return torch.cat([w_risky_clipped, w_cash_new], dim=-1)
+
+class MLPDenoiser(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256, t_dim=16, use_layernorm=False):
+        """
+        Args:
+            state_dim (int): The size of the flattened market returns.
+            action_dim (int): The total number of assets in the portfolio (risky assets + cash).
+            hidden_dim (int): Size of the hidden layers in the MLP.
+            t_dim (int): Size of the sinusoidal time embedding.
+            use_layernorm (bool): Stabilizes gradients for large-dimensional inputs.
+        """
+        super().__init__()
+        self.t_dim = t_dim
+        
+        # The input to our MLP is the combination of the state, the noisy action, and the time embedding
+        in_dim = state_dim + action_dim + t_dim
+        
+        layers: list[nn.Module] = [nn.Linear(in_dim, hidden_dim)]
+        if use_layernorm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.Mish())
+        
+        layers.extend([nn.Linear(hidden_dim, hidden_dim)])
+        if use_layernorm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.Mish())
+        
+        layers.extend([nn.Linear(hidden_dim, hidden_dim)])
+        if use_layernorm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.Mish())
+        
+        layers.append(nn.Linear(hidden_dim, action_dim))
+        
+        self.net = nn.Sequential(*layers)
+        
+    def time_embedding(self, t):
+        """
+        Converts a single integer timestep (e.g., t=45) into a robust vector of size t_dim.
+        This helps the neural network understand the concept of "time" smoothly.
+        """
+        half_dim = self.t_dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=t.device) * -embeddings)
+        embeddings = t * embeddings
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+    def forward(self, state, action_noisy, t):
+        """
+        Predicts the noise added to the action.
+        """
+        # Embed the integer time into a vector
+        t_embed = self.time_embedding(t)
+        
+        # Concatenate the market state, the noisy weights, and the time vector together
+        x = torch.cat([state, action_noisy, t_embed], dim=-1)
+        
+        # Pass it through the MLP to predict the noise!
+        return self.net(x)
+
+class MeanCovMLPDenoiser(nn.Module):
+    def __init__(self, n_assets, action_dim, hidden_dim=256, t_dim=16, use_layernorm=False, condition_on_prev_weights=False):
+        """
+        A control benchmark architecture that bypasses representation learning.
+        It calculates the Mean and Covariance explicitly from the raw state tensor
+        and normalizes these flattened features before feeding them directly to the MLP.
+        """
+        super().__init__()
+        self.t_dim = t_dim
+        self.condition_on_prev_weights = condition_on_prev_weights
+        
+        # 1. Calculate the dimensionality of the extracted features: n_assets (Means) + n_assets*n_assets (Covariances)
+        extracted_features_dim = n_assets + (n_assets * n_assets)
+        
+        # 2. Instantiate a 1D Batch Normalization layer.
+        # Standardizes explicitly extracted features across the batch to ensure scale equivalence 
+        # between Mean vectors and Covariance matrices prior to linear projection.
+        # eps=1e-10 overrides PyTorch's default to prevent drowning out tiny financial variances.
+        self.feature_norm = nn.BatchNorm1d(extracted_features_dim, eps=1e-10)
+        
+        # 3. Calculate total input dimension for the MLP
+        in_dim = extracted_features_dim + action_dim + t_dim
+        if condition_on_prev_weights:
+            in_dim += action_dim
+        
+        # 4. Construct the Neural Network layers
+        layers: list[nn.Module] = [nn.Linear(in_dim, hidden_dim)]
+        if use_layernorm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.Mish())
+        
+        layers.extend([nn.Linear(hidden_dim, hidden_dim)])
+        if use_layernorm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.Mish())
+        
+        layers.append(nn.Linear(hidden_dim, action_dim))
+        
+        self.net = nn.Sequential(*layers)
+
+    def _compute_mean_and_cov(self, state):
+        """
+        Mathematically extracts the rolling mean and covariance from the batch state.
+        
+        Args:
+            state (torch.Tensor): Raw market returns of shape (batch_size, window_size, n_assets).
+            
+        Returns:
+            torch.Tensor: Flattened concatenated Mean and Covariance of shape (batch_size, n_assets + n_assets^2).
+        """
+        batch_size, window_size, n_assets = state.shape
+        
+        # Calculate Mean (shape: batch_size, n_assets)
+        mu = state.mean(dim=1)
+        
+        # Calculate Covariance Matrix (shape: batch_size, n_assets, n_assets)
+        # Center the data by subtracting the mean
+        state_centered = state - mu.unsqueeze(1)
+        
+        # Batch Matrix Multiplication (bmm): (batch, assets, window) x (batch, window, assets)
+        # We divide by (window_size - 1) for standard unbiased sample covariance
+        cov = torch.bmm(state_centered.transpose(1, 2), state_centered) / (window_size - 1)
+        
+        # Flatten both and concatenate (Output shape: batch_size, 110)
+        return torch.cat([mu.view(batch_size, -1), cov.view(batch_size, -1)], dim=-1)
+
+    def time_embedding(self, t):
+        half_dim = self.t_dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=t.device) * -embeddings)
+        embeddings = t * embeddings
+        return torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+
+    def forward(self, state, action_noisy, t, prev_weights=None):
+        # 1. Intercept the raw state and extract Mean/Covariance features
+        features = self._compute_mean_and_cov(state)
+        
+        # 2. Normalize features (safeguarding against batch size of 1 during training)
+        if features.shape[0] > 1 or not self.training:
+            features = self.feature_norm(features)
+        
+        # 3. Embed Time
+        half_dim = self.t_dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=t.device) * -embeddings)
+        embeddings = t * embeddings
+        t_embed = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        
+        # 4. Combine and pass to the Neural Network
+        if self.condition_on_prev_weights:
+            if prev_weights is None:
+                raise ValueError("prev_weights must be provided when condition_on_prev_weights is True.")
+            x = torch.cat((features, action_noisy, t_embed, prev_weights), dim=-1)
+        else:
+            x = torch.cat((features, action_noisy, t_embed), dim=-1)
+        return self.net(x)
+
+class TransformerDenoiser(nn.Module):
+    def __init__(self, n_assets, action_dim, window_size=60, hidden_dim=256, t_dim=16, n_heads=4, n_layers=2):
+        """
+        An Attention-based Denoiser that processes the raw 2D market state.
+        
+        Args:
+            n_assets (int): Number of stock features per day.
+            action_dim (int): Total number of assets in the portfolio (stocks + cash).
+            window_size (int): Number of days in the sequence.
+            hidden_dim (int): Size of the Transformer embedding dimension (d_model).
+            t_dim (int): Size of the sinusoidal time embedding.
+            n_heads (int): Number of attention heads.
+            n_layers (int): Number of Transformer encoder layers.
+        """
+        super().__init__()
+        self.t_dim = t_dim
+        
+        # 1. Project the raw stock returns (n_assets) up to the hidden_dim
+        self.state_proj = nn.Linear(n_assets, hidden_dim)
+        
+        # 2. Positional Encodings so the Transformer understands chronological time
+        self.pos_embedding = nn.Parameter(torch.randn(1, window_size, hidden_dim) * 0.02)
+        
+        # 3. The Transformer Backbone (processes the 2D matrix)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=n_heads, 
+            dim_feedforward=hidden_dim * 4,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        
+        # 4. Final MLP to process the combined [State + Noisy Action + Time]
+        in_dim = hidden_dim + action_dim + t_dim
+        self.final_mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+        self.net = self.final_mlp
+        
+    def time_embedding(self, t):
+        """Converts integer timestep into a continuous sinusoidal embedding."""
+        half_dim = self.t_dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=t.device) * -embeddings)
+        embeddings = t * embeddings
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+
+    def forward(self, state, action_noisy, t):
+        # 1. Process the 2D State Matrix (batch, window_size, n_assets)
+        # Project up to hidden_dim and add positional encodings
+        x = self.state_proj(state) + self.pos_embedding
+        
+        # Pass through the Self-Attention layers
+        x = self.transformer(x)
+        
+        # Pool the sequence by taking the mean across the window_size dimension
+        # This gives us a single 1D vector summarizing the entire 60-day market state
+        state_repr = x.mean(dim=1) 
+        
+        # 2. Prepare Time Embeddings
+        t_embed = self.time_embedding(t)
+        
+        # 3. Combine everything and predict the noise!
+        combined = torch.cat([state_repr, action_noisy, t_embed], dim=-1)
+        return self.final_mlp(combined)
+
+class PortDiff(nn.Module):
+    # Type hints to keep the IDE's static checker happy
+    betas: torch.Tensor
+    alphas_cumprod: torch.Tensor
+    sqrt_alphas_cumprod: torch.Tensor
+    sqrt_one_minus_alphas_cumprod: torch.Tensor
+    
+    def __init__(self, denoiser, num_timesteps=100, beta_schedule="linear"):
+        """
+        The core Diffusion Model that wraps the MLPDenoiser.
+        
+        Args:
+            denoiser (nn.Module): The neural network that predicts the noise.
+            num_timesteps (int): The total number of steps to add/remove noise (T).
+            beta_schedule (str): The noise scheduling strategy ("linear" or "cosine").
+        """
+        super().__init__()
+        self.denoiser = denoiser
+        self.num_timesteps = num_timesteps
+        
+        # 1. Beta Schedule: Controls how much noise to add at each step
+        if beta_schedule == "linear":
+            betas = torch.linspace(0.0001, 0.02, num_timesteps)
+        elif beta_schedule == "cosine":
+            # The Cosine Schedule adds noise gently at first to protect the structure
+            steps = num_timesteps + 1
+            x = torch.linspace(0, num_timesteps, steps)
+            s = 0.008
+            alphas_cumprod = torch.cos(((x / num_timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            betas = torch.clip(betas, 0.0001, 0.9999)
+        else:
+            raise ValueError(f"Unknown beta schedule: {beta_schedule}")
+            
+        # 2. Alphas: Math shortcuts needed for the diffusion formulas
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        
+        # We register these as "buffers" so PyTorch saves them but doesn't try to train them.
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
+        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
+
+    def forward(self, state, action_clean, weights=None, prev_weights=None):
+        """
+        TRAINING ONLY: Calculates the loss by adding noise and asking the denoiser to guess it.
+        Accepts optional AWR weights for Reinforcement Learning.
+        """
+        batch_size = state.shape[0]
+        
+        # 1. Pick a random timestep 't' for every sample in the batch
+        t = torch.randint(0, self.num_timesteps, (batch_size,), device=state.device).long()
+        
+        # 2. Generate pure random Gaussian noise
+        noise = torch.randn_like(action_clean)
+        
+        # 3. Add the noise to the clean expert weights based on the schedule at timestep 't'
+        sqrt_alphas_t = self.sqrt_alphas_cumprod[t].view(-1, 1)
+        sqrt_one_minus_alphas_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
+        action_noisy = sqrt_alphas_t * action_clean + sqrt_one_minus_alphas_t * noise
+        
+        # 4. Ask the MLPDenoiser to guess the noise we just added
+        if prev_weights is not None:
+            predicted_noise = self.denoiser(state, action_noisy, t.unsqueeze(-1).float(), prev_weights=prev_weights)
+        else:
+            predicted_noise = self.denoiser(state, action_noisy, t.unsqueeze(-1).float())
+        
+        # 5. Calculate MSE without instantly averaging it (reduction='none')
+        loss = F.mse_loss(predicted_noise, noise, reduction='none')
+        
+        # Average the loss across the asset dimension, keeping it per-sample in the batch
+        loss = loss.mean(dim=-1) 
+        
+        # 6. Apply Advantage weights if we are doing RL (AWR)
+        if weights is not None:
+            loss = loss * weights.squeeze()
+            
+        # Finally, return the average loss of the batch
+        return loss.mean()
+    
+    @torch.no_grad()
+    def sample(
+        self,
+        state: torch.Tensor,
+        prev_weights: torch.Tensor | None = None,
+        sampler: str = "ddim",
+    ) -> torch.Tensor:
+        """
+        INFERENCE ONLY (Real World): Denoises Gaussian noise into portfolio weights conditional on the market state.
+
+        Supports three reverse sampling schemes:
+        - "ddim" (Song et al., 2020): Deterministic implicit model reverse step with sigma_t = 0.
+        - "ddpm_det": Deterministic DDPM mean step (Ho et al., 2020 with sigma_t = 0).
+        - "ddpm_stoch": Standard stochastic DDPM with Langevin noise injection (sigma_t > 0).
+
+        Args:
+            state: Market state tensor of shape (batch_size, state_dim).
+            prev_weights: Incumbent portfolio weights of shape (batch_size, action_dim).
+            sampler: Sampling strategy ("ddim", "ddpm_det", or "ddpm_stoch"). Defaults to "ddim".
+
+        Returns:
+            Feasible portfolio weight tensor of shape (batch_size, action_dim).
+        """
+        if sampler not in ("ddim", "ddpm_det", "ddpm_stoch"):
+            raise ValueError(
+                f"Unknown sampler: '{sampler}'. Supported options are 'ddim', 'ddpm_det', 'ddpm_stoch'."
+            )
+
+        batch_size = state.shape[0]
+        action_dim = self.denoiser.net[-1].out_features
+
+        # Initialize latent state at t = T
+        if sampler in ("ddim", "ddpm_det"):
+            generator = torch.Generator(device=state.device)
+            generator.manual_seed(42)
+            action_t = torch.randn(
+                (batch_size, action_dim),
+                generator=generator,
+                device=state.device,
+                dtype=torch.float32,
+            )
+        else:
+            action_t = torch.randn(
+                (batch_size, action_dim),
+                device=state.device,
+                dtype=torch.float32,
+            )
+
+        # Reverse diffusion trajectory from T-1 down to 0
+        for t_step in reversed(range(self.num_timesteps)):
+            t = torch.full((batch_size, 1), t_step, device=state.device, dtype=torch.float32)
+
+            if prev_weights is not None:
+                predicted_noise = self.denoiser(state, action_t, t, prev_weights=prev_weights)
+            else:
+                predicted_noise = self.denoiser(state, action_t, t)
+
+            if sampler == "ddim":
+                # Song et al. (2020) deterministic DDIM reverse step
+                pred_x0 = (
+                    action_t - self.sqrt_one_minus_alphas_cumprod[t_step] * predicted_noise
+                ) / self.sqrt_alphas_cumprod[t_step]
+
+                if t_step > 0:
+                    alpha_cumprod_prev = self.alphas_cumprod[t_step - 1]
+                    action_t = (
+                        torch.sqrt(alpha_cumprod_prev) * pred_x0
+                        + torch.sqrt(1.0 - alpha_cumprod_prev) * predicted_noise
+                    )
+                else:
+                    action_t = pred_x0
+            else:
+                # Ho et al. (2020) DDPM formulation
+                alpha_t = 1.0 - self.betas[t_step]
+                sqrt_one_minus_alpha_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t_step]
+
+                # Mean reverse step
+                action_t = (
+                    action_t - (1.0 - alpha_t) / sqrt_one_minus_alpha_cumprod_t * predicted_noise
+                ) / torch.sqrt(alpha_t)
+
+                # Stochastic perturbation (omitted in deterministic mode)
+                if sampler == "ddpm_stoch" and t_step > 0:
+                    noise = torch.randn_like(action_t)
+                    sigma_t = torch.sqrt(self.betas[t_step])
+                    action_t = action_t + sigma_t * noise
+
+        # Custom Feasibility Mapping: Enforce Markowitz constraints
+        final_weights = map_to_feasible_portfolio(action_t, max_weight=0.20)
+        return final_weights
