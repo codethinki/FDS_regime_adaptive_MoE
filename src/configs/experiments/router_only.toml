@@ -1,0 +1,6 @@
+# Analyse the HMM router alone on real data (train + validation)
+[run]
+mode = "router"
+
+[router]
+types = ["hmm_soft"]

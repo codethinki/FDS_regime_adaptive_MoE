@@ -1,0 +1,9 @@
+# Analyse the HMM router alone on the synthetic market; checks recovery of the true regimes
+[run]
+mode = "router"
+
+[data]
+source = "synthetic"
+
+[router]
+types = ["hmm_soft"]

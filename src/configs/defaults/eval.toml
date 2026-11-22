@@ -1,0 +1,2 @@
+split = "val"                    # train | val
+periods_per_year = 252

@@ -1,0 +1,2 @@
+# rolling window in periods (window ends at t, inclusive)
+window = 6

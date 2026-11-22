@@ -1,0 +1,5 @@
+n_experts = 3
+expert = "mlp"                   # key in models.experts.EXPERTS
+
+[mlp]
+hidden = [64, 32]

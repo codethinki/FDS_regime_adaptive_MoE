@@ -23,7 +23,7 @@ _Draft for the next meeting._
 == Setup
 
 - *Assets:* SPY, TLT, GLD, DBC + cash (BIL); daily data from 2013
-- *Split:* train 2013-01 to 2024-08, test 2024-09 to today (to be fixed before any training run)
+- *Split (fixed):* train 2013--2021, validation 2022 to 2024-08 (tuning), test 2024-09 to today (lockbox, evaluated once at the end). Enforced in code: `regime_moe.data` only returns test data with `allow_test=True`.
 - *Costs:* 5 bps per unit of turnover; signals lagged by one day
 
 == Method
@@ -59,7 +59,7 @@ $ min_(Theta, s) sum_t ||x_t - theta_(s_t)||^2 + lambda sum_t bb(1){s_t != s_(t-
   [Single PPO agent with $p_t$ in the state (Raj 2025)], [does the MoE add anything beyond the regime signal?],
 )
 
-Reference values, test period 2024-09 to 2026-11: equal weight Sharpe 0.94, SPY 0.71, vol targeting 0.47.
+Reference values, validation period 2022-01 to 2024-08: vol targeting Sharpe 0.39, SPY 0.32, 200-day MA 0.24, equal weight 0.05, 60/40 $-0.19$.
 
 == Evaluation
 - Sharpe (vs. T-bills) with standard errors; paired test of Sharpe differences (Ledoit & Wolf 2008)
@@ -67,11 +67,12 @@ Reference values, test period 2024-09 to 2026-11: equal weight Sharpe 0.94, SPY 
 - Router: switches per year, detection delay, agreement with in-sample regimes
 - 5+ seeds per RL configuration, reported as mean $plus.minus$ std
 
-== First prototype result (`notebooks/01_jump_model_router.ipynb`)
-- JM with 2 states, $lambda = 50$: in-sample, Bull has SPY Sharpe 1.76 and Bear $-0.25$ (train).
-- *Online* the separation shrinks: Bear has SPY Sharpe 0.71 (train) because detection lags by a median of 24 days, so the router often switches to Bear after the drop and stays there into the rebound.
+== First prototype result (`src/notebooks/01_jump_model_router.ipynb`)
+- JM with 2 states, $lambda = 50$, trained 2013--2021: in-sample, Bull has SPY Sharpe 1.82 and Bear $-0.16$.
+- *Online* (causal) the separation disappears on the training window: Bear 1.04 vs. Bull 1.05, because detection lags by a median of 20 days, so the router often switches to Bear after the drop and stays there into the rebound.
+- On validation (2022 to 2024-08) the online router does separate: Bear (53% of days) has SPY Sharpe 0.10 vs. Bull 0.79. Slow, persistent bear markets suit it; V-shaped crashes do not.
 - Implication: detection latency is the central problem of the router, which supports sub-question 1.
-- GLD is the only asset with a positive Sharpe in Bear (0.84 in-sample), so the experts do have something regime-specific to learn.
+- GLD has a positive Sharpe in Bear (1.17 in-sample) but a negative one in Bull, so the experts do have something regime-specific to learn.
 
 == Paper structure (draft)
 + *Introduction:* non-stationary markets, regime-adaptive MoE, research question
@@ -84,7 +85,7 @@ Reference values, test period 2024-09 to 2026-11: equal weight Sharpe 0.94, SPY 
 + *Conclusion*
 
 == Open questions for the meeting
-- Is the test period 2024-09 to today fixed, or may we choose it (e.g. 2022 to today, which includes a bear market)?
+- We fixed train 2013--2021, validation 2022 to 2024-08, test 2024-09 to today. Is that acceptable?
 - Is the template simulator mandatory, or optional as a comparison?
 - Is the RL algorithm free to choose (PPO), or is the template's IL + AWR expected?
 - Which deliverable: paper format and length, code, presentation?

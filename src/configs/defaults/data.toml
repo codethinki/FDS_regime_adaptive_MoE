@@ -1,0 +1,13 @@
+source = "real"                  # real | synthetic
+
+# real data (yfinance); cash is traded as an asset
+assets = ["SPY", "TLT", "GLD", "DBC"]
+cash = "BIL"
+
+# split dates; the test period is only loadable with allow_test=True
+warmup_start = "2012-01-01"      # one year for rolling / EWM features
+train_start = "2013-01-01"
+train_end = "2021-12-31"
+val_start = "2022-01-01"
+val_end = "2024-08-31"
+test_start = "2024-09-01"

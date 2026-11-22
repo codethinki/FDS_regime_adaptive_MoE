@@ -223,3 +223,6 @@ __marimo__/
 # OS / build artifacts
 .DS_Store
 doc/*.pdf
+
+# experiment outputs
+results/

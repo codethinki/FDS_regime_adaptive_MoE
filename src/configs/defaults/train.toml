@@ -1,0 +1,6 @@
+objective = "mean_variance"      # key in objectives.OBJECTIVES
+risk_aversion = 2.0
+epochs = 35
+batch_size = 128
+learning_rate = 1e-3
+seeds = [0, 1, 2, 3, 4]          # every router is trained once per seed

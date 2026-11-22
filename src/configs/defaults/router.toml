@@ -1,0 +1,11 @@
+# routers compared in one experiment: uniform | hmm_hard | hmm_soft | learned
+types = ["uniform", "hmm_hard", "hmm_soft", "learned"]
+
+[hmm]
+n_states = 3                     # must equal model.n_experts (state k -> expert k)
+covariance_type = "diag"         # spherical | diag | full | tied
+n_iter = 200
+seed = 42
+
+[learned]
+hidden = 32

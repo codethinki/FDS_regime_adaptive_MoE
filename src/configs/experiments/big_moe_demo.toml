@@ -1,0 +1,10 @@
+# The big MoE demo (src/prototypes/big_moe_routing_demo) under project standards:
+# same synthetic market (seed 42 = the demo's market), noise feature, model and training
+# hyperparameters (all in configs/defaults); additionally 5 market paths x 5 model seeds,
+# causal features without partial windows, no wrap-around target, identical init per router.
+[data]
+source = "synthetic"
+
+[synthetic]
+seeds = [42, 1, 2, 3, 4]
+noise_feature = true

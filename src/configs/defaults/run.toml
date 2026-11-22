@@ -1,0 +1,3 @@
+# moe:    train the Big MoE for every router x seed, evaluate portfolios
+# router: fit the regime routers only and analyse their regimes (no MoE training)
+mode = "moe"
