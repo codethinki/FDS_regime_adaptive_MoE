@@ -219,3 +219,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .ipynb_checkpoints/
+
+# OS / build artifacts
+.DS_Store
+doc/*.pdf
